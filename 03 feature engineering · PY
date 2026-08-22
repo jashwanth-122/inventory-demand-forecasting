@@ -1,0 +1,74 @@
+import pandas as pd
+import numpy as np
+
+sales_long = pd.read_parquet("outputs/sales_long_cleaned.parquet")
+print("loaded shape:", sales_long.shape)
+
+# has to be sorted by series then date, otherwise lag/rolling features
+# get computed across the wrong rows
+sales_long = sales_long.sort_values(["id", "date"]).reset_index(drop=True)
+
+# flag instead of guessing a price - "not stocked" is different from
+# "stocked but didn't sell"
+sales_long["item_not_stocked"] = sales_long["sell_price"].isnull().astype("int8")
+
+# lag features: sales N days ago, per series
+for lag in [1, 7, 14, 28]:
+    sales_long[f"lag_{lag}"] = sales_long.groupby("id")["units_sold"].shift(lag)
+
+# rolling averages, shifted by 1 first so we never use today's own
+# sales to build today's feature (that'd be leakage)
+for window in [7, 28]:
+    sales_long[f"rolling_mean_{window}"] = (
+        sales_long.groupby("id")["units_sold"]
+        .shift(1)
+        .rolling(window)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+sales_long["day_of_week"] = sales_long["date"].dt.dayofweek
+sales_long["day_of_month"] = sales_long["date"].dt.day
+sales_long["week_of_year"] = sales_long["date"].dt.isocalendar().week.astype("int16")
+sales_long["is_weekend"] = sales_long["day_of_week"].isin([5, 6]).astype("int8")
+
+# collapse snap_CA/TX/WI into one column based on each row's own state.
+# vectorized with np.select - a row-by-row apply here blows up memory
+# at 58M rows
+sales_long["snap_today"] = np.select(
+    condlist=[
+        sales_long["state_id"] == "CA",
+        sales_long["state_id"] == "TX",
+        sales_long["state_id"] == "WI"
+    ],
+    choicelist=[
+        sales_long["snap_CA"],
+        sales_long["snap_TX"],
+        sales_long["snap_WI"]
+    ]
+).astype("int8")
+
+sales_long["has_event"] = sales_long["event_name_1"].notnull().astype("int8")
+
+# first 28 days of each series can't have lag_28 / rolling_mean_28,
+# nothing to look back on yet - drop those rows
+before = sales_long.shape[0]
+sales_long = sales_long.dropna(subset=["lag_28", "rolling_mean_28"])
+print(f"dropped {before - sales_long.shape[0]} rows with insufficient history")
+
+feature_columns = [
+    "id", "item_id", "dept_id", "cat_id", "store_id", "state_id",
+    "date", "units_sold",
+    "sell_price", "item_not_stocked",
+    "lag_1", "lag_7", "lag_14", "lag_28",
+    "rolling_mean_7", "rolling_mean_28",
+    "day_of_week", "day_of_month", "week_of_year", "is_weekend",
+    "snap_today", "has_event"
+]
+
+model_data = sales_long[feature_columns]
+print("final shape:", model_data.shape)
+print(model_data.head())
+
+model_data.to_parquet("outputs/model_data.parquet", index=False)
+print("saved outputs/model_data.parquet")

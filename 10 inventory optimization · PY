@@ -1,0 +1,63 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+
+lgb_results = pd.read_csv("outputs/lgb_results.csv")
+print("loaded shape:", lgb_results.shape)
+
+# M5 doesn't include real inventory data (no lead times, no current
+# stock levels, no service level targets) so these are assumptions,
+# clearly labeled as such rather than pretending Walmart gave us
+# this data. picked reasonable, commonly cited retail defaults.
+LEAD_TIME_DAYS = 7        # days between placing an order and it arriving
+SERVICE_LEVEL = 0.95      # target probability of not stocking out
+Z_SCORE = norm.ppf(SERVICE_LEVEL)  # ~1.645 for 95% service level
+
+print(f"\nassumptions: lead time = {LEAD_TIME_DAYS} days, "
+      f"service level = {SERVICE_LEVEL}, z-score = {Z_SCORE:.3f}")
+
+# forecast error per series - this is what safety stock is actually
+# protecting against. a series where the model's predictions are
+# consistently close to actual needs less buffer than one where
+# they're all over the place, even if the average forecast is fine
+per_series = lgb_results.groupby("id").agg(
+    avg_daily_demand=("lgb_forecast", "mean"),
+    forecast_std=("units_sold", lambda x: (x - lgb_results.loc[x.index, "lgb_forecast"]).std())
+).reset_index()
+
+# safety stock formula: z * forecast error std * sqrt(lead time)
+# this is the standard formula assuming lead time demand is roughly
+# normal - a real ops team would validate that assumption per item,
+# but it's a reasonable starting point for sparse/intermittent
+# demand items too, within the scope of this project
+per_series["safety_stock"] = Z_SCORE * per_series["forecast_std"] * np.sqrt(LEAD_TIME_DAYS)
+
+# reorder point: expected demand during lead time, plus the buffer
+per_series["reorder_point"] = (per_series["avg_daily_demand"] * LEAD_TIME_DAYS) + per_series["safety_stock"]
+
+# not calculating a recommended order quantity here - that would need
+# current inventory levels, ordering costs, and supplier constraints,
+# none of which M5 provides. reorder_point tells you when to reorder;
+# how much to order is a separate question this data can't honestly
+# answer without more assumptions than we're willing to make up
+
+per_series = per_series.round(2)
+
+print("\nsample of inventory recommendations:")
+print(per_series.head(10))
+
+print("\nsummary stats across all series:")
+print(per_series[["avg_daily_demand", "forecast_std", "safety_stock", "reorder_point"]].describe())
+
+# flag series where the model's forecast error is large relative to
+# its own average demand - these are the riskiest items to stock,
+# since a small miss on a low-volume item can mean a stockout or a
+# big overstock in relative terms
+per_series["error_to_demand_ratio"] = per_series["forecast_std"] / per_series["avg_daily_demand"].replace(0, np.nan)
+
+high_risk = per_series.sort_values("error_to_demand_ratio", ascending=False).head(20)
+print("\ntop 20 highest-risk items (largest forecast error relative to their own demand):")
+print(high_risk[["id", "avg_daily_demand", "forecast_std", "error_to_demand_ratio", "safety_stock"]])
+
+per_series.to_csv("outputs/inventory_recommendations.csv", index=False)
+print("\nsaved outputs/inventory_recommendations.csv")

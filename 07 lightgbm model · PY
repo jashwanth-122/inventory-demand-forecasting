@@ -1,0 +1,101 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+
+train = pd.read_parquet("outputs/train.parquet")
+test = pd.read_parquet("outputs/test.parquet")
+
+print("train shape:", train.shape)
+print("test shape:", test.shape)
+
+# this is a global model - one LightGBM model trained across all
+# 30,490 series at once, rather than one model per series like ETS
+# was. the model learns patterns across items/stores/categories
+# together, which is both faster than fitting thousands of separate
+# models and generally more accurate, since sparse or low-volume
+# series benefit from what the model learns on similar series.
+
+feature_cols = [
+    "sell_price", "item_not_stocked",
+    "lag_1", "lag_7", "lag_14", "lag_28",
+    "rolling_mean_7", "rolling_mean_28",
+    "day_of_week", "day_of_month", "week_of_year", "is_weekend",
+    "snap_today", "has_event"
+]
+
+# cat_id, dept_id, store_id, state_id carry real signal too, but
+# they're strings - LightGBM can handle categoricals natively if we
+# tell it which columns are categorical, so we convert them here
+# instead of one-hot encoding, which would blow up memory at this row
+# count
+categorical_cols = ["cat_id", "dept_id", "store_id", "state_id"]
+
+for col in categorical_cols:
+    train[col] = train[col].astype("category")
+    test[col] = test[col].astype("category")
+
+feature_cols = feature_cols + categorical_cols
+
+X_train = train[feature_cols]
+y_train = train["units_sold"]
+X_test = test[feature_cols]
+y_test = test["units_sold"]
+
+train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=categorical_cols)
+
+params = {
+    "objective": "poisson",  # sales counts are non-negative integers,
+                              # poisson fits that better than plain
+                              # regression, especially given how many
+                              # zero-sales rows there are
+    "metric": "mae",
+    "learning_rate": 0.05,
+    "num_leaves": 128,
+    "min_data_in_leaf": 100,
+    "verbose": -1
+}
+
+model = lgb.train(
+    params,
+    train_data,
+    num_boost_round=500
+)
+
+predictions = model.predict(X_test)
+predictions = np.clip(predictions, 0, None)  # no negative sales
+
+def wape(actual, predicted):
+    return np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual))
+
+def mae(actual, predicted):
+    return np.mean(np.abs(actual - predicted))
+
+def rmse(actual, predicted):
+    return np.sqrt(np.mean((actual - predicted) ** 2))
+
+lgb_mae = mae(y_test, predictions)
+lgb_rmse = rmse(y_test, predictions)
+lgb_wape = wape(y_test, predictions)
+
+print("\nLightGBM results on full test set:")
+print("MAE:", lgb_mae)
+print("RMSE:", lgb_rmse)
+print("WAPE:", lgb_wape)
+
+# feature importance - useful for the write-up, shows what the model
+# is actually relying on
+importance = pd.DataFrame({
+    "feature": feature_cols,
+    "importance": model.feature_importance(importance_type="gain")
+}).sort_values("importance", ascending=False)
+
+print("\nfeature importance:")
+print(importance)
+
+test_results = test[["id", "date", "units_sold"]].copy()
+test_results["lgb_forecast"] = predictions
+test_results.to_csv("outputs/lgb_results.csv", index=False)
+
+model.save_model("models/lgb_model.txt")
+
+print("\nsaved outputs/lgb_results.csv and models/lgb_model.txt")

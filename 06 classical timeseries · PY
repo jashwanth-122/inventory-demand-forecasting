@@ -1,0 +1,100 @@
+import pandas as pd
+import numpy as np
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import warnings
+warnings.filterwarnings("ignore")
+
+train = pd.read_parquet("outputs/train.parquet")
+test = pd.read_parquet("outputs/test.parquet")
+
+print("train shape:", train.shape)
+print("test shape:", test.shape)
+
+# fitting a classical model (ETS) separately for each of the 30,490
+# series isn't practical here - that's ~30k individual model fits,
+# which would take hours on a laptop and isn't how this would be
+# done in practice anyway. this is actually one of the real reasons
+# M5 competitors moved to global ML models (one model trained across
+# every series) instead of classical per-series forecasting - it's
+# both faster and usually more accurate when you have this many
+# related series to learn from.
+#
+# so here we fit ETS on a sample of series, weighted toward the
+# higher-revenue items from the SQL step, since those are the ones
+# that matter most and give a fair read on how classical methods
+# perform on the series we actually care about.
+
+top_items = (
+    train.groupby("item_id")["units_sold"].sum()
+    .sort_values(ascending=False)
+    .head(50)
+    .index
+)
+
+sample_ids = train[train["item_id"].isin(top_items)]["id"].unique()[:100]
+
+print(f"\nrunning ETS on a sample of {len(sample_ids)} series")
+
+results = []
+
+for series_id in sample_ids:
+    series_train = train[train["id"] == series_id].sort_values("date")
+    series_test = test[test["id"] == series_id].sort_values("date")
+
+    if len(series_test) == 0:
+        continue
+
+    y_train = series_train["units_sold"].values
+
+    try:
+        model = ExponentialSmoothing(
+            y_train,
+            trend=None,
+            seasonal="add",
+            seasonal_periods=7,
+            initialization_method="estimated"
+        ).fit()
+
+        forecast = model.forecast(len(series_test))
+        forecast = np.clip(forecast, 0, None)  # sales can't be negative
+
+        actual = series_test["units_sold"].values
+
+        results.append(pd.DataFrame({
+            "id": series_id,
+            "actual": actual,
+            "forecast": forecast
+        }))
+    except Exception as e:
+        print(f"skipped {series_id}: {e}")
+
+ets_results = pd.concat(results, ignore_index=True)
+
+def wape(actual, predicted):
+    return np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual))
+
+def mae(actual, predicted):
+    return np.mean(np.abs(actual - predicted))
+
+def rmse(actual, predicted):
+    return np.sqrt(np.mean((actual - predicted) ** 2))
+
+ets_wape = wape(ets_results["actual"], ets_results["forecast"])
+ets_mae = mae(ets_results["actual"], ets_results["forecast"])
+ets_rmse = rmse(ets_results["actual"], ets_results["forecast"])
+
+print(f"\nETS results on {ets_results['id'].nunique()} top-revenue series:")
+print("MAE:", ets_mae)
+print("RMSE:", ets_rmse)
+print("WAPE:", ets_wape)
+
+# compare against the same rolling_mean_28 baseline, but only on
+# this same subset of series, so it's an apples-to-apples comparison
+baseline_subset = test[test["id"].isin(sample_ids)]
+baseline_wape = wape(baseline_subset["units_sold"], baseline_subset["rolling_mean_28"])
+
+print(f"\nrolling_mean_28 baseline on the same {len(sample_ids)} series, for comparison:")
+print("WAPE:", baseline_wape)
+
+ets_results.to_csv("outputs/ets_results.csv", index=False)
+print("\nsaved outputs/ets_results.csv")

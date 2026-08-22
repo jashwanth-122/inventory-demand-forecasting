@@ -1,0 +1,56 @@
+import pandas as pd
+import numpy as np
+
+sales_long = pd.read_parquet("outputs/sales_long.parquet")
+print("loaded shape:", sales_long.shape)
+
+# duplicate check - same item, same store, same day should only
+# appear once. if it shows up more than once, something went wrong
+# in the melt or join step
+duplicate_count = sales_long.duplicated(subset=["id", "date"]).sum()
+print(f"\nduplicate id+date rows: {duplicate_count}")
+
+if duplicate_count > 0:
+    print("dropping duplicates, keeping first occurrence")
+    sales_long = sales_long.drop_duplicates(subset=["id", "date"], keep="first")
+    print("shape after dropping duplicates:", sales_long.shape)
+else:
+    print("no duplicates found - clean")
+
+# negative sales check - shouldn't exist, but worth confirming
+# rather than assuming
+negative_count = (sales_long["units_sold"] < 0).sum()
+print(f"\nrows with negative units_sold: {negative_count}")
+
+# outlier check - look for suspiciously huge single-day sales values
+# per item-store series. using a simple rule: anything more than 5x
+# that series' own typical (75th percentile) sales is flagged for
+# review, not automatically removed - a real spike (like a big
+# promotion) is legitimate data, not an error, so this just surfaces
+# candidates rather than deleting anything automatically
+series_p75 = sales_long.groupby("id")["units_sold"].transform(lambda x: x.quantile(0.75))
+outlier_threshold = series_p75 * 5
+
+sales_long["is_potential_outlier"] = (
+    (sales_long["units_sold"] > outlier_threshold) &
+    (sales_long["units_sold"] > 5)  # ignore low-volume items where
+                                     # even a small sale count would
+                                     # technically trip the ratio
+)
+
+outlier_count = sales_long["is_potential_outlier"].sum()
+print(f"\npotential outlier rows flagged: {outlier_count} "
+      f"({outlier_count / len(sales_long) * 100:.3f}% of all rows)")
+
+print("\nsample of flagged rows:")
+print(sales_long[sales_long["is_potential_outlier"]]
+      [["id", "date", "units_sold"]].head(10))
+
+# not removing these automatically - in retail data, big spikes are
+# usually real (promotions, holidays, restocks after a stockout),
+# so deleting them could actually make the model worse by hiding
+# real demand patterns. flagging them here so it's a visible,
+# documented decision rather than a silent guess either way
+
+sales_long.to_parquet("outputs/sales_long_cleaned.parquet", index=False)
+print("\nsaved outputs/sales_long_cleaned.parquet")

@@ -1,0 +1,72 @@
+import pandas as pd
+import numpy as np
+
+model_data = pd.read_parquet("outputs/model_data.parquet")
+print("loaded shape:", model_data.shape)
+
+# holding out the last 28 days as a test set - that matches M5's own
+# forecast horizon and keeps this realistic (predicting the future,
+# not just interpolating within known history)
+cutoff_date = model_data["date"].max() - pd.Timedelta(days=28)
+
+train = model_data[model_data["date"] <= cutoff_date]
+test = model_data[model_data["date"] > cutoff_date]
+
+print("train shape:", train.shape)
+print("test shape:", test.shape)
+print("train date range:", train["date"].min(), "to", train["date"].max())
+print("test date range:", test["date"].min(), "to", test["date"].max())
+
+# naive baseline: predict today = same as 7 days ago. simplest
+# possible forecast that still respects weekly seasonality, which
+# is why lag_7 beats lag_1 as a naive choice here (grocery demand
+# has a strong day-of-week pattern)
+test = test.copy()
+test["naive_forecast"] = test["lag_7"]
+
+# a couple of standard forecasting metrics. WAPE (weighted absolute
+# percentage error) is the one M5 itself leans on since it handles
+# the zero-heavy, intermittent series better than plain MAPE does
+def mae(actual, predicted):
+    return np.mean(np.abs(actual - predicted))
+
+def rmse(actual, predicted):
+    return np.sqrt(np.mean((actual - predicted) ** 2))
+
+def wape(actual, predicted):
+    return np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual))
+
+baseline_mae = mae(test["units_sold"], test["naive_forecast"])
+baseline_rmse = rmse(test["units_sold"], test["naive_forecast"])
+baseline_wape = wape(test["units_sold"], test["naive_forecast"])
+
+print("\nnaive baseline (lag_7) on test set:")
+print("MAE:", baseline_mae)
+print("RMSE:", baseline_rmse)
+print("WAPE:", baseline_wape)
+
+# also worth checking the rolling_mean_28 as a second baseline -
+# smoother than lag_7, might actually do better or worse depending
+# on how much weekly seasonality matters vs just recent average level
+test["rolling_forecast"] = test["rolling_mean_28"]
+
+rolling_mae = mae(test["units_sold"], test["rolling_forecast"])
+rolling_rmse = rmse(test["units_sold"], test["rolling_forecast"])
+rolling_wape = wape(test["units_sold"], test["rolling_forecast"])
+
+print("\nrolling mean (28-day) baseline on test set:")
+print("MAE:", rolling_mae)
+print("RMSE:", rolling_rmse)
+print("WAPE:", rolling_wape)
+
+# save train/test split and results so later scripts don't redo this
+train.to_parquet("outputs/train.parquet", index=False)
+test.to_parquet("outputs/test.parquet", index=False)
+
+baseline_results = pd.DataFrame([
+    {"model": "naive_lag7", "mae": baseline_mae, "rmse": baseline_rmse, "wape": baseline_wape},
+    {"model": "rolling_mean_28", "mae": rolling_mae, "rmse": rolling_rmse, "wape": rolling_wape},
+])
+baseline_results.to_csv("outputs/baseline_results.csv", index=False)
+
+print("\nsaved outputs/train.parquet, outputs/test.parquet, outputs/baseline_results.csv")

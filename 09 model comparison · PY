@@ -1,0 +1,77 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+test = pd.read_parquet("outputs/test.parquet")
+lgb_results = pd.read_csv("outputs/lgb_results.csv")
+ets_results = pd.read_csv("outputs/ets_results.csv")
+lstm_results = pd.read_csv("outputs/lstm_results.csv")
+
+def wape(actual, predicted):
+    return np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual))
+
+# ETS and LSTM only ran on the top-100-revenue-item sample, so to
+# compare all four models fairly, everything needs to be scored on
+# that same subset - not just on whatever data each script happened
+# to have on hand when it ran.
+sample_ids = ets_results["id"].unique()
+
+baseline_full = wape(test["units_sold"], test["rolling_mean_28"])
+baseline_subset = wape(
+    test[test["id"].isin(sample_ids)]["units_sold"],
+    test[test["id"].isin(sample_ids)]["rolling_mean_28"]
+)
+
+lgb_full = wape(lgb_results["units_sold"], lgb_results["lgb_forecast"])
+lgb_subset = wape(
+    lgb_results[lgb_results["id"].isin(sample_ids)]["units_sold"],
+    lgb_results[lgb_results["id"].isin(sample_ids)]["lgb_forecast"]
+)
+
+ets_wape = wape(ets_results["actual"], ets_results["forecast"])
+lstm_wape = wape(lstm_results["actual"], lstm_results["forecast"])
+
+# two comparison tables: one on the full 30,490-series test set
+# (baseline and LightGBM only, since that's all that ran there),
+# and one on the top-100-series subset (all four models, fair
+# apples-to-apples)
+full_comparison = pd.DataFrame([
+    {"model": "rolling_mean_28_baseline", "wape": baseline_full, "scope": "full test set (30,490 series)"},
+    {"model": "lightgbm", "wape": lgb_full, "scope": "full test set (30,490 series)"},
+])
+
+subset_comparison = pd.DataFrame([
+    {"model": "rolling_mean_28_baseline", "wape": baseline_subset, "scope": "top 100 series"},
+    {"model": "ets", "wape": ets_wape, "scope": "top 100 series"},
+    {"model": "lstm", "wape": lstm_wape, "scope": "top 100 series"},
+    {"model": "lightgbm", "wape": lgb_subset, "scope": "top 100 series"},
+])
+
+print("full test set comparison:")
+print(full_comparison)
+
+print("\ntop-100-series comparison (fair, all models):")
+print(subset_comparison.sort_values("wape"))
+
+# chart for the subset comparison, since that's the one that's
+# actually apples-to-apples across all four models
+plt.figure(figsize=(8, 5))
+subset_sorted = subset_comparison.sort_values("wape")
+plt.bar(subset_sorted["model"], subset_sorted["wape"])
+plt.ylabel("WAPE (lower is better)")
+plt.title("Model Comparison on Top 100 Revenue Series")
+plt.tight_layout()
+plt.savefig("outputs/03_model_comparison.png")
+plt.close()
+
+print("\nsaved outputs/03_model_comparison.png")
+
+full_comparison.to_csv("outputs/full_comparison.csv", index=False)
+subset_comparison.to_csv("outputs/subset_comparison.csv", index=False)
+print("saved outputs/full_comparison.csv and outputs/subset_comparison.csv")
+
+# takeaway: on the 100-series subset, rolling_mean_28 was basically
+# unbeatable - ETS and LSTM both came in at or above it. LightGBM
+# only pulls ahead once it's trained globally across all 30,490
+# series, which tracks - it's picking up patterns from thousands of
+# related series that a per-series model never gets to see.

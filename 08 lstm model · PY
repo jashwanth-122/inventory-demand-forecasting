@@ -1,0 +1,148 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+train = pd.read_parquet("outputs/train.parquet")
+test = pd.read_parquet("outputs/test.parquet")
+
+print("train shape:", train.shape)
+print("test shape:", test.shape)
+
+# LSTMs need actual sequences (ordered history per series), not a
+# flat feature table like LightGBM used. training on all 30,490
+# series with full history would be slow on a laptop CPU, so this
+# runs on the same top-revenue sample used in the ETS script, for a
+# fair comparison against both ETS and the baseline on that subset.
+top_items = (
+    train.groupby("item_id")["units_sold"].sum()
+    .sort_values(ascending=False)
+    .head(50)
+    .index
+)
+sample_ids = train[train["item_id"].isin(top_items)]["id"].unique()[:100]
+
+sequence_length = 28  # look back 28 days to predict the next day
+
+def build_sequences(df, ids):
+    X, y = [], []
+    for series_id in ids:
+        series = df[df["id"] == series_id].sort_values("date")
+        values = series["units_sold"].values
+        for i in range(len(values) - sequence_length):
+            X.append(values[i:i + sequence_length])
+            y.append(values[i + sequence_length])
+    return np.array(X, dtype="float32"), np.array(y, dtype="float32")
+
+# build training sequences from train, and evaluate on test the same
+# way LightGBM/ETS were evaluated - predicting each of the 28 held
+# out test days
+full_history = pd.concat([train, test])
+full_history = full_history[full_history["id"].isin(sample_ids)]
+
+X_train, y_train = build_sequences(train[train["id"].isin(sample_ids)], sample_ids)
+print("training sequences:", X_train.shape)
+
+class SalesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X).unsqueeze(-1)  # shape: (samples, seq_len, 1)
+        self.y = torch.tensor(y).unsqueeze(-1)
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_dataset = SalesDataset(X_train, y_train)
+train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+
+class SalesLSTM(nn.Module):
+    def __init__(self, hidden_size=32):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n[-1])
+
+model = SalesLSTM()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+loss_fn = nn.L1Loss()  # MAE loss, matches how we're scoring everything else
+
+epochs = 10
+
+for epoch in range(epochs):
+    total_loss = 0
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        predictions = model(X_batch)
+        loss = loss_fn(predictions, y_batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"epoch {epoch + 1}/{epochs} - avg loss: {total_loss / len(train_loader):.4f}")
+
+# forecast the 28 held-out test days for each series, walking forward
+# one day at a time using the model's own previous predictions as
+# input for the next step (since we don't have real future values to
+# feed it during inference)
+model.eval()
+results = []
+
+for series_id in sample_ids:
+    history = train[train["id"] == series_id].sort_values("date")["units_sold"].values
+    actual_future = test[test["id"] == series_id].sort_values("date")["units_sold"].values
+
+    if len(actual_future) == 0 or len(history) < sequence_length:
+        continue
+
+    window = list(history[-sequence_length:])
+    forecasts = []
+
+    with torch.no_grad():
+        for _ in range(len(actual_future)):
+            x = torch.tensor(window[-sequence_length:], dtype=torch.float32).view(1, sequence_length, 1)
+            pred = model(x).item()
+            pred = max(pred, 0)  # no negative sales
+            forecasts.append(pred)
+            window.append(pred)
+
+    results.append(pd.DataFrame({
+        "id": series_id,
+        "actual": actual_future,
+        "forecast": forecasts
+    }))
+
+lstm_results = pd.concat(results, ignore_index=True)
+
+def wape(actual, predicted):
+    return np.sum(np.abs(actual - predicted)) / np.sum(np.abs(actual))
+
+def mae(actual, predicted):
+    return np.mean(np.abs(actual - predicted))
+
+def rmse(actual, predicted):
+    return np.sqrt(np.mean((actual - predicted) ** 2))
+
+lstm_wape = wape(lstm_results["actual"], lstm_results["forecast"])
+lstm_mae = mae(lstm_results["actual"], lstm_results["forecast"])
+lstm_rmse = rmse(lstm_results["actual"], lstm_results["forecast"])
+
+print(f"\nLSTM results on {lstm_results['id'].nunique()} top-revenue series:")
+print("MAE:", lstm_mae)
+print("RMSE:", lstm_rmse)
+print("WAPE:", lstm_wape)
+
+# same subset comparison as the ETS script, so all three (baseline,
+# ETS, LSTM) can be lined up fairly against each other
+baseline_subset = test[test["id"].isin(sample_ids)]
+baseline_wape = wape(baseline_subset["units_sold"], baseline_subset["rolling_mean_28"])
+print(f"\nrolling_mean_28 baseline on the same series, for comparison: {baseline_wape}")
+
+lstm_results.to_csv("outputs/lstm_results.csv", index=False)
+torch.save(model.state_dict(), "models/lstm_model.pt")
+
+print("\nsaved outputs/lstm_results.csv and models/lstm_model.pt")
