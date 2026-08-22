@@ -192,6 +192,8 @@ It combines expected demand during the assumed lead time with safety stock to re
 
 An interactive Power BI dashboard was developed to present the final forecasting and inventory recommendations.
 
+![Power BI Inventory Dashboard](Power%20BI%20Dashboard.png)
+
 The dashboard includes:
 
 Average Daily Demand
@@ -265,6 +267,8 @@ Power BI Dashboard
 10 inventory optimization . PY — Safety stock and reorder point calculations
 
 Inventory_Demand_Forecast_Dashboard.pbix — Interactive Power BI dashboard
+
+Power BI Dashboard.png — Power BI dashboard preview
 
 calendar.csv — Calendar information used in the forecasting pipeline
 
